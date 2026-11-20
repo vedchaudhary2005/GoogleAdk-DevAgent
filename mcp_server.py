@@ -3,10 +3,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# 1. MCP Server instance banaya
+
 app = Server("devagent-mcp-server")
 
-# 2. Available tools ki list define ki
+# 2. Available tools list
 @app.list_tools()
 async def list_tools() -> list[Tool]:
     return [
@@ -23,7 +23,7 @@ async def list_tools() -> list[Tool]:
         )
     ]
 
-# 3. Tool ka actual logic likha
+
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "calculate_metrics":
