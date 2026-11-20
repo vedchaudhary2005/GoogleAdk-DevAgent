@@ -34,7 +34,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     
     raise ValueError(f"Unknown tool: {name}")
 
-# 4. Stdio transport par server run karna
+# 4. Stdio transport server run 
 async def main():
     async with stdio_server() as (read, write):
         await app.run(read, write, app.create_initialization_options())
