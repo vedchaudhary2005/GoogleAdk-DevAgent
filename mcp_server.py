@@ -80,7 +80,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     elif name == "read_local_file":
         filename = arguments.get("filename")
         try:
-            if not os.path-exists(filename) and not os.path.exists(filename): # basic check
+            if not os.path.exists(filename) and not os.path.exists(filename): # basic check
                 pass
             with open(filename, "r", encoding="utf-8") as f:
                 content = f.read()
