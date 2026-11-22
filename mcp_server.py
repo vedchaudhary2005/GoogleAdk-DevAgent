@@ -83,6 +83,7 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["lines_of_code"]
             }
+            
         ),
 
         Tool(
@@ -152,6 +153,24 @@ async def list_tools() -> list[Tool]:
             }
         )
     ]
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+    if name == "calculate_metrics":
+        raw_loc = arguments.get("lines_of_code", 0)
+        
+        # Safe conversion: agar string ya 'tool_use_failed' bhi aaye toh crash na ho
+        try:
+            loc = int(raw_loc)
+        except (TypeError, ValueError):
+            loc = 0  # Default fallback agar invalid data aaye
+            
+        complexity = "High" if loc > 40 else "Low"
+        return [TextContent(type="text", text=f"Total Lines: {loc}, Estimated Complexity: {complexity}")]
+    
+    # Baaki tools ke elif conditions yahan aayengi...
+    
+    raise ValueError(f"Unknown tool: {name}")
 
 
 # 4. HANDLE MCP TOOL CALLS
@@ -358,7 +377,7 @@ async def call_tool(
 
 
 
-# 5. START MCP SERVER
+# 5. START MCP SERVER  
 
 async def main():
 
