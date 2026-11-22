@@ -8,7 +8,7 @@ from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.mcp_tool import McpToolset
 from mcp import StdioServerParameters
-
+from google.adk.agents.readonly_context import ReadonlyContext
 
 
 # 1. CONFIGURATION
@@ -18,7 +18,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 MODEL = LiteLlm(
-    model="groq/llama-3.3-70b-versatile"
+    model="groq/qwen/qwen3.8-27b"
 )
 
 
@@ -110,16 +110,19 @@ writer_agent = LlmAgent(
 # 5. REVIEWER AGENT
 
 
-reviewer_agent = LlmAgent(
-    name="reviewer_agent",
-    model=MODEL,
+def reviewer_instruction(context: ReadonlyContext) -> str:
+    generated_code = context.state.get("generated_code", "")
 
-    description=(
-        "Reviews generated code and identifies bugs, "
-        "security issues and improvements."
-    ),
+    print("REVIEWER STATE KEYS:", list(context.state.keys()))
 
-    instruction="""
+    if not generated_code:
+        return """
+        The Writer Agent did not provide generated code.
+        Report that code is missing.
+        Do not invent or generate code yourself.
+        """
+
+    return f"""
     You are a senior code reviewer.
 
     Review the following code:
@@ -140,10 +143,20 @@ reviewer_agent = LlmAgent(
     APPROVED: No major issues found.
 
     Do not rewrite the entire project unnecessarily.
-    """,
+    """
 
+
+reviewer_agent = LlmAgent(
+    name="reviewer_agent",
+    model=MODEL,
+    description=(
+        "Reviews generated code and identifies bugs, "
+        "security issues and improvements."
+    ),
+    instruction=reviewer_instruction,
     output_key="review_feedback"
 )
+
 
 
 
