@@ -1,20 +1,35 @@
+
 import os
 import sys
 from dotenv import load_dotenv
+
 from google.adk.agents import LlmAgent, LoopAgent
+from google.adk.agents.readonly_context import ReadonlyContext
 from google.adk.models.lite_llm import LiteLlm
-from google.adk.tools.mcp_tool import MCPToolSet
-from mcp import StdioServerParameters
 from google.adk.tools.mcp_tool import McpToolset
+from mcp import StdioServerParameters
 
-load_dotenv()
 
-# MCP SERVER CONNECTION SETUP 
+
+# 1. CONFIGURATION
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
+MODEL = LiteLlm(
+    model="groq/openai/gpt-oss-20b"
+)
+
+
+# 2. MCP SERVER CONNECTION
+
 
 mcp_server_params = StdioServerParameters(
     command=sys.executable,
-    args=[os.path.join(BASE_DIR, "mcp_server.py")]
+    args=[
+        os.path.join(BASE_DIR, "mcp_server.py")
+    ]
 )
 
 mcp_tools = McpToolset(
@@ -22,61 +37,160 @@ mcp_tools = McpToolset(
     require_confirmation=True
 )
 
-#  HUMAN-IN-THE-LOOP
-def hitl_approval_callback(tool_name: str, arguments: dict) -> bool:
-    print(f"\n🚨 [SECURITY GATE - HITL] Agent wants to execute: '{tool_name}'")
-    print(f"Arguments: {arguments}")
-    
-    choice = input("Do you want to approve this action? (y/n): ").strip().lower()
-    if choice == 'y':
-        print("✅ Action Approved.")
-        return True
-    else:
-        print("❌ Action Rejected.")
-        return False
 
-#  WRITER AGENT(Connected with MCP Tools)
+
+# 3. WRITER DYNAMIC INSTRUCTION
+
+
+def writer_instruction(context: ReadonlyContext) -> str:
+
+    feedback = context.state.get(
+        "review_feedback",
+        ""
+    )
+
+    if feedback:
+        feedback_section = f"""
+        PREVIOUS REVIEWER FEEDBACK:
+        {feedback}
+
+        You must improve your previous code based on this feedback.
+        Do not ignore the reviewer's corrections.
+        """
+    else:
+        feedback_section = """
+        This is the first iteration.
+        Create the initial solution based on the user's request.
+        """
+
+    return f"""
+    You are a senior software engineer.
+
+    Your responsibilities:
+    1. Understand the user's programming task.
+    2. Write clean, readable and maintainable code.
+    3. Read existing files when necessary.
+    4. Use MCP tools when required.
+    5. Save the final code using save_code_to_file.
+    6. Never claim that a file was saved unless the tool confirms it.
+
+    {feedback_section}
+
+    If you are revising code, preserve working functionality.
+    Explain what you changed and why.
+
+    Return the complete updated code in your final response.
+    """
+
+
+
+# 4. WRITER AGENT
+
+
 writer_agent = LlmAgent(
     name="writer_agent",
-    model=LiteLlm(model="groq/openai/gpt-oss-20b"),
-    description="Writes production code and utilizes MCP developer tools.",
-    instruction=(
-     "You are a senior software engineer. Write clean code, "
-    "read existing files when requested, and use the provided MCP tools "
-    "(save_code_to_file, read_local_file, calculate_metrics, "
-    "run_python_file, web_search) to complete development tasks."
+    model=MODEL,
+
+    description=(
+        "Writes, modifies and saves production-oriented code "
+        "using MCP developer tools."
     ),
-    tools=[MCPToolSet(connection_params=mcp_server_params)]
+
+    instruction=writer_instruction,
+
+    tools=[
+        mcp_tools
+    ],
+
+    output_key="generated_code"
 )
 
-#  REVIEWER AGENT
+
+
+# 5. REVIEWER AGENT
+
+
 reviewer_agent = LlmAgent(
     name="reviewer_agent",
-    model=LiteLlm(model="groq/openai/gpt-oss-20b"),
-    instruction=(
-        "Review this generated code: {generated_code}. "
-        "Identify bugs and provide corrections."
+    model=MODEL,
+
+    description=(
+        "Reviews generated code and identifies bugs, "
+        "security issues and improvements."
     ),
+
+    instruction="""
+    You are a senior code reviewer.
+
+    Review the following code:
+
+    {generated_code}
+
+    Check:
+    1. Syntax and runtime errors.
+    2. Incorrect logic.
+    3. Missing imports and dependencies.
+    4. Security vulnerabilities.
+    5. Error handling.
+    6. Code quality and maintainability.
+
+    Give specific corrections to the Writer Agent.
+
+    If the code is good, clearly say:
+    APPROVED: No major issues found.
+
+    Do not rewrite the entire project unnecessarily.
+    """,
+
     output_key="review_feedback"
 )
 
-#  REFINEMENT LOOP WORKFLOW 
+
+
+# 6. REFINEMENT LOOP
+
+
 code_loop = LoopAgent(
     name="code_loop",
-    sub_agents=[writer_agent, reviewer_agent],
+
+    sub_agents=[
+        writer_agent,
+        reviewer_agent
+    ],
+
     max_iterations=2
 )
 
-# ROOT AGENT 
+
+
+# 7. ROOT AGENT
+
+
 root_agent = LlmAgent(
     name="root_agent",
-    model=LiteLlm(model="groq/openai/gpt-oss-20b"),
-    description="Main coordinator for software development tasks.",
-    instruction=(
-        "You are an enterprise coding assistant (DevAgent Enterprise). "
-        "GUARDRAIL RULE: You ONLY help with programming, debugging, code review, and architecture. "
-        "If the user asks anything outside of software development, strictly refuse. "
-        "For valid coding tasks, delegate them to the `code_loop` workflow."
+    model=MODEL,
+
+    description=(
+        "Main coordinator for DevAgent Enterprise."
     ),
-    sub_agents=[code_loop]
+
+    instruction="""
+    You are DevAgent Enterprise, an AI software development assistant.
+
+    GUARDRAILS:
+    - Only assist with programming, debugging,
+      code review and software architecture.
+    - Politely refuse unrelated requests.
+    - Never claim to have executed or saved code
+      unless the corresponding tool confirms it.
+
+    For valid software development tasks:
+    delegate the task to code_loop.
+
+    The code_loop contains a Writer Agent and Reviewer Agent.
+    """,
+
+    sub_agents=[
+        code_loop
+    ]
 )
