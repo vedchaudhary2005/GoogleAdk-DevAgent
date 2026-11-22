@@ -41,9 +41,10 @@ writer_agent = LlmAgent(
     model=LiteLlm(model="groq/openai/gpt-oss-20b"),
     description="Writes production code and utilizes MCP developer tools.",
     instruction=(
-        "You are a senior software engineer. Write clean code, read existing files "
-        "when requested, and use the provided MCP tools (like save_code_to_file, calculate_metrics, web_search) "
-        "to complete the development task."
+     "You are a senior software engineer. Write clean code, "
+    "read existing files when requested, and use the provided MCP tools "
+    "(save_code_to_file, read_local_file, calculate_metrics, "
+    "run_python_file, web_search) to complete development tasks."
     ),
     tools=[MCPToolSet(connection_params=mcp_server_params)]
 )
