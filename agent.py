@@ -1,16 +1,25 @@
 import os
+import sys
 from dotenv import load_dotenv
 from google.adk.agents import LlmAgent, LoopAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.mcp_tool import MCPToolSet
 from mcp import StdioServerParameters
+from google.adk.tools.mcp_tool import McpToolset
 
 load_dotenv()
 
 # MCP SERVER CONNECTION SETUP 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 mcp_server_params = StdioServerParameters(
-    command="python",
-    args=["mcp_server.py"]
+    command=sys.executable,
+    args=[os.path.join(BASE_DIR, "mcp_server.py")]
+)
+
+mcp_tools = McpToolset(
+    connection_params=mcp_server_params,
+    require_confirmation=True
 )
 
 #  HUMAN-IN-THE-LOOP
@@ -43,11 +52,11 @@ writer_agent = LlmAgent(
 reviewer_agent = LlmAgent(
     name="reviewer_agent",
     model=LiteLlm(model="groq/openai/gpt-oss-20b"),
-    description="Reviews code for bugs and quality standards.",
     instruction=(
-        "Review the code written by the writer agent. Verify syntax, logic, and structure. "
-        "Provide constructive feedback so the writer agent can refine it in the next iteration."
-    )
+        "Review this generated code: {generated_code}. "
+        "Identify bugs and provide corrections."
+    ),
+    output_key="review_feedback"
 )
 
 #  REFINEMENT LOOP WORKFLOW 
