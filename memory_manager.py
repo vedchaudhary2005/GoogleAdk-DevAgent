@@ -24,12 +24,14 @@ class MongoMemoryManager:
         self.conversations = None
         self.messages = None
         self.memory = None
+        self.user_memories = None
         self._is_connected = False
 
         # In-memory fallbacks if MongoDB is unavailable
         self._mem_conversations: Dict[str, Dict[str, Any]] = {}
         self._mem_messages: Dict[str, List[Dict[str, Any]]] = {}
         self._mem_memory: Dict[str, Dict[str, Any]] = {}
+        self._mem_user_memories: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         self.connect()
 
@@ -43,6 +45,7 @@ class MongoMemoryManager:
             self.conversations = self.db["conversations"]
             self.messages = self.db["messages"]
             self.memory = self.db["memory"]
+            self.user_memories = self.db["user_memories"]
 
             # Create efficient indexes
             self.conversations.create_index([("id", ASCENDING)], unique=True)
@@ -53,6 +56,10 @@ class MongoMemoryManager:
 
             self.memory.create_index([("conversation_id", ASCENDING)], unique=True)
             self.memory.create_index([("topics", ASCENDING)])
+
+            # Persistent personal facts collection indexed by user_id and key
+            self.user_memories.create_index([("user_id", ASCENDING), ("key", ASCENDING)], unique=True)
+            self.user_memories.create_index([("user_id", ASCENDING)])
 
             self._is_connected = True
             logger.info("Connected to MongoDB successfully and verified indexes.")
@@ -74,14 +81,17 @@ class MongoMemoryManager:
         self,
         title: str = "New Conversation",
         model: Optional[str] = None,
-        conversation_id: Optional[str] = None
+        conversation_id: Optional[str] = None,
+        user_id: Optional[str] = "default_user"
     ) -> Dict[str, Any]:
         """Create a new conversation record."""
         conv_id = conversation_id or str(uuid.uuid4())
+        uid = (user_id or "default_user").strip()
         now = datetime.now(timezone.utc)
         doc = {
             "id": conv_id,
             "conversation_id": conv_id,
+            "user_id": uid,
             "title": title or "New Conversation",
             "model": model,
             "created_at": now.isoformat(),
@@ -456,6 +466,172 @@ class MongoMemoryManager:
 
         return "\n".join(memory_lines)
 
+    # ==========================================
+    # USER PERSONAL MEMORY (CROSS-CHAT PERSISTENCE)
+    # ==========================================
+
+    def is_mongo_alive(self) -> bool:
+        """Check if MongoDB client is connected and responding."""
+        if not self._is_connected or self.client is None or self.user_memories is None:
+            return False
+        try:
+            self.client.admin.command("ping")
+            return True
+        except Exception:
+            return False
+
+    def save_user_memory(self, user_id: str, key: str, value: str) -> bool:
+        """
+        Save or update a persistent personal fact for a user in MongoDB.
+        Uses upsert on (user_id, key) to avoid duplicates and update existing facts.
+        Returns True only if successfully persisted to MongoDB.
+        """
+        uid = (user_id or "default_user").strip()
+        norm_key = key.strip().lower()
+        norm_val = value.strip()
+        now = datetime.now(timezone.utc).isoformat()
+
+        doc = {
+            "user_id": uid,
+            "key": norm_key,
+            "value": norm_val,
+            "updated_at": now
+        }
+
+        if self.is_mongo_alive():
+            try:
+                self.user_memories.update_one(
+                    {"user_id": uid, "key": norm_key},
+                    {
+                        "$set": {"value": norm_val, "updated_at": now},
+                        "$setOnInsert": {"user_id": uid, "key": norm_key, "created_at": now}
+                    },
+                    upsert=True
+                )
+                if uid not in self._mem_user_memories:
+                    self._mem_user_memories[uid] = {}
+                self._mem_user_memories[uid][norm_key] = doc
+                logger.info("Saved persistent personal memory to MongoDB for user '%s': %s=%s", uid, norm_key, norm_val)
+                return True
+            except Exception as e:
+                logger.error("Failed to save personal memory to MongoDB: %s", e)
+                return False
+        else:
+            logger.warning("MongoDB unavailable; persistent memory was not saved.")
+            return False
+
+    def get_user_memories(self, user_id: str) -> List[Dict[str, Any]]:
+        """Retrieve all persistent personal facts for a given user from MongoDB."""
+        uid = (user_id or "default_user").strip()
+        if self.is_mongo_alive():
+            try:
+                cursor = self.user_memories.find({"user_id": uid}, {"_id": 0})
+                return list(cursor)
+            except Exception as e:
+                logger.error("Error retrieving user memories from MongoDB: %s", e)
+                return []
+        return list(self._mem_user_memories.get(uid, {}).values())
+
+    def get_user_memory(self, user_id: str, key: str) -> Optional[str]:
+        """Retrieve a specific personal fact for a user."""
+        uid = (user_id or "default_user").strip()
+        norm_key = key.strip().lower()
+        if self.is_mongo_alive():
+            try:
+                doc = self.user_memories.find_one({"user_id": uid, "key": norm_key}, {"_id": 0})
+                if doc:
+                    return doc.get("value")
+            except Exception as e:
+                logger.error("Error retrieving user memory '%s' from MongoDB: %s", norm_key, e)
+        user_dict = self._mem_user_memories.get(uid, {})
+        doc = user_dict.get(norm_key)
+        return doc.get("value") if doc else None
+
+    def delete_user_memory(self, user_id: str, key: str) -> bool:
+        """Delete a persistent personal fact for a user."""
+        uid = (user_id or "default_user").strip()
+        norm_key = key.strip().lower()
+        if self.is_mongo_alive():
+            try:
+                self.user_memories.delete_one({"user_id": uid, "key": norm_key})
+                if uid in self._mem_user_memories:
+                    self._mem_user_memories[uid].pop(norm_key, None)
+                return True
+            except Exception as e:
+                logger.error("Error deleting user memory '%s': %s", norm_key, e)
+                return False
+        if uid in self._mem_user_memories:
+            self._mem_user_memories[uid].pop(norm_key, None)
+        return True
+
+    def format_personal_memory_context(self, user_id: str) -> Optional[str]:
+        """Format personal memories into a clean prompt context block."""
+        memories = self.get_user_memories(user_id)
+        if not memories:
+            return None
+
+        lines = [
+            "[PERSISTENT PERSONAL MEMORY (RETRIEVED FROM MONGODB)]:",
+            f"The following verified persistent facts about user '{user_id}' are stored in MongoDB:"
+        ]
+        for m in memories:
+            lines.append(f"- {m['key']}: {m['value']}")
+        lines.append(
+            "Always use these verified facts when answering questions about the user's identity, name, or preferences."
+        )
+        return "\n".join(lines)
+
+    def extract_memory_intent(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract user intent to remember or update a personal fact.
+        Only triggers when user explicitly asks to remember or update personal facts.
+        """
+        if not text or len(text.strip()) < 3:
+            return None
+        raw_text = text.strip()
+
+        # 1. Update/Change/Correct specific key (e.g. name, language, role)
+        m = re.search(r'(?:actually\s*,?\s*)?(?:update|change|correct)\s+(?:my\s+)?([a-zA-Z\s]{2,20})\s+(?:to|as)\s+([^\.\n]+)', raw_text, re.I)
+        if m:
+            key = m.group(1).strip().lower()
+            val = m.group(2).strip().rstrip('.')
+            if key.startswith('my '):
+                key = key[3:].strip()
+            return {'action': 'update', 'key': key, 'value': val}
+
+        # 1b. 'my name is actually X' or 'my name is Rahul instead'
+        m = re.search(r'(?:my\s+)?name\s+is\s+(?:actually\s+)?([A-Za-z]+)', raw_text, re.I)
+        if m and any(w in raw_text.lower() for w in ['update', 'change', 'actually', 'correct', 'instead']):
+            return {'action': 'update', 'key': 'name', 'value': m.group(1).strip()}
+
+        # 2. Explicit request to remember name
+        if re.search(r'\bremember\b', raw_text, re.I):
+            # 'my name is X' or 'call me X' combined with 'remember'
+            m = re.search(r'(?:my\s+name\s+is|call\s+me)\s+([A-Za-z]+)', raw_text, re.I)
+            if m:
+                val = m.group(1).strip()
+                if val.lower() not in ['a', 'an', 'the', 'not', 'here', 'writing', 'that', 'this', 'code', 'file']:
+                    return {'action': 'remember', 'key': 'name', 'value': val}
+
+            # 'remember (that) (my) name is X' or 'remember my name: X'
+            m = re.search(r'remember\s+(?:that\s+)?(?:my\s+)?name\s*(?:is|:)?\s*([A-Za-z]+)', raw_text, re.I)
+            if m:
+                val = m.group(1).strip()
+                if val.lower() not in ['a', 'an', 'the', 'not', 'here', 'writing', 'that', 'this', 'code', 'file']:
+                    return {'action': 'remember', 'key': 'name', 'value': val}
+
+            # 3. Explicit 'Remember that X is Y' or 'Remember: X is Y' or 'Remember my X is Y'
+            m = re.search(r'remember(?:\s*:\s*|\s+(?:that\s+)?)([a-zA-Z\s]{2,25})\s+(?:is|to\s+be|as|=)\s+([^\.\n]+)', raw_text, re.I)
+            if m:
+                k = m.group(1).strip().lower()
+                if k.startswith('my '):
+                    k = k[3:].strip()
+                v = m.group(2).strip().rstrip('.')
+                if k and v and k not in ['that', 'this', 'to', 'it', 'the', 'code', 'file', 'script']:
+                    return {'action': 'remember', 'key': k, 'value': v}
+
+        return None
+
 
 # Global instance
 memory_manager = MongoMemoryManager()
@@ -470,3 +646,10 @@ save_message = memory_manager.save_message
 get_messages = memory_manager.get_messages
 get_cross_chat_context = memory_manager.get_cross_chat_context
 update_conversation_memory = memory_manager.update_conversation_memory
+is_mongo_alive = memory_manager.is_mongo_alive
+save_user_memory = memory_manager.save_user_memory
+get_user_memories = memory_manager.get_user_memories
+get_user_memory = memory_manager.get_user_memory
+delete_user_memory = memory_manager.delete_user_memory
+format_personal_memory_context = memory_manager.format_personal_memory_context
+extract_memory_intent = memory_manager.extract_memory_intent

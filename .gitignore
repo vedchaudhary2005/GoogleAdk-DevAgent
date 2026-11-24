@@ -94,3 +94,6 @@ frontend/
 
 #workspace
 workspace/
+
+#static
+static/
