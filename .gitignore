@@ -87,3 +87,10 @@ desktop.ini
 *.tmp
 *.bak
 *.orig
+
+
+# Frontend
+frontend/
+
+#workspace
+workspace/
