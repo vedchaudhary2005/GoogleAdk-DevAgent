@@ -309,6 +309,16 @@ class MongoMemoryManager:
     # CROSS-CHAT LONG-TERM MEMORY
     
 
+    def list_conversations_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+        """List conversations belonging to a specific user."""
+        uid = (user_id or "default_user").strip()
+        if self._is_connected and self.conversations is not None:
+            try:
+                return list(self.conversations.find({"user_id": uid}, {"_id": 0}))
+            except Exception as e:
+                logger.error("Error listing conversations for user %s: %s", uid, e)
+        return [c for c in self._mem_conversations.values() if c.get("user_id") == uid]
+
     def update_conversation_memory(
         self,
         conversation_id: str,
@@ -317,6 +327,9 @@ class MongoMemoryManager:
         topics: Optional[List[str]] = None
     ) -> bool:
         """Store or update a distilled memory representation of a conversation."""
+        conv = self.get_conversation(conversation_id)
+        conv_user_id = (conv.get("user_id") if conv else None) or "default_user"
+
         if summary is None:
             msgs = self.get_messages(conversation_id)
             if not msgs:
@@ -340,6 +353,7 @@ class MongoMemoryManager:
         now = datetime.now(timezone.utc).isoformat()
         doc = {
             "conversation_id": conversation_id,
+            "user_id": conv_user_id,
             "summary": summary,
             "key_files": key_files or [],
             "topics": [t.lower() for t in (topics or [])],
@@ -364,15 +378,17 @@ class MongoMemoryManager:
         self,
         current_conversation_id: Optional[str] = None,
         query: str = "",
-        exclude_conversation_id: Optional[str] = None
+        exclude_conversation_id: Optional[str] = None,
+        user_id: Optional[str] = None
     ) -> Optional[str]:
         """
         Sensible Context Retrieval:
         Search other conversations for keywords, files, or concepts relevant to `query`.
+        Restricted to the given user_id to preserve strict user isolation.
         Returns a concise memory summary block, or None if no relevant past context exists.
-        Does NOT dump entire histories to keep token usage controlled.
         """
         cid = current_conversation_id or exclude_conversation_id or ""
+        uid = (user_id or "default_user").strip() if user_id else None
         if not query or len(query.strip()) < 4:
             return None
 
@@ -393,17 +409,15 @@ class MongoMemoryManager:
         if self._is_connected and self.memory is not None:
             try:
                 regex_pattern = "|".join([re.escape(k) for k in keywords[:5]])
-                cursor = self.memory.find(
-                    {
-                        "conversation_id": {"$ne": cid},
-                        "$or": [
-                            {"topics": {"$in": keywords}},
-                            {"key_files": {"$regex": regex_pattern, "$options": "i"}},
-                            {"summary": {"$regex": regex_pattern, "$options": "i"}}
-                        ]
-                    },
-                    {"_id": 0}
-                ).limit(3)
+                base_filter: Dict[str, Any] = {"conversation_id": {"$ne": cid}}
+                if uid:
+                    base_filter["user_id"] = uid
+                base_filter["$or"] = [
+                    {"topics": {"$in": keywords}},
+                    {"key_files": {"$regex": regex_pattern, "$options": "i"}},
+                    {"summary": {"$regex": regex_pattern, "$options": "i"}}
+                ]
+                cursor = self.memory.find(base_filter, {"_id": 0}).limit(3)
                 matched_memories = list(cursor)
             except Exception as e:
                 logger.error("Error searching cross-chat memory in Mongo: %s", e)
@@ -411,6 +425,8 @@ class MongoMemoryManager:
         if not matched_memories:
             for mem_cid, mem in self._mem_memory.items():
                 if mem_cid == cid:
+                    continue
+                if uid and mem.get("user_id") and mem.get("user_id") != uid:
                     continue
                 mem_text = (mem.get("summary", "") + " " + " ".join(mem.get("key_files", []))).lower()
                 if any(k in mem_text for k in keywords):
@@ -424,22 +440,30 @@ class MongoMemoryManager:
                 file_matches = [k for k in keywords if "." in k or k in ["calculator", "agent", "metrics", "test"]]
                 if file_matches:
                     regex_str = "|".join([re.escape(f) for f in file_matches])
+                    msg_filter: Dict[str, Any] = {
+                        "conversation_id": {"$ne": cid},
+                        "content": {"$regex": regex_str, "$options": "i"}
+                    }
+                    if uid:
+                        user_conv_ids = [c["id"] for c in self.list_conversations_for_user(uid)]
+                        valid_ids = [u_cid for u_cid in user_conv_ids if u_cid != cid]
+                        if not valid_ids:
+                            return None
+                        msg_filter["conversation_id"] = {"$in": valid_ids}
+
                     cursor = self.messages.find(
-                        {
-                            "conversation_id": {"$ne": cid},
-                            "content": {"$regex": regex_str, "$options": "i"}
-                        },
+                        msg_filter,
                         {"_id": 0, "conversation_id": 1, "content": 1, "role": 1}
                     ).sort("created_at", DESCENDING).limit(2)
 
                     msg_hits = list(cursor)
                     for hit in msg_hits:
-                        cid = hit["conversation_id"]
-                        conv = self.get_conversation(cid)
+                        hit_cid = hit["conversation_id"]
+                        conv = self.get_conversation(hit_cid)
                         c_title = conv.get("title", "Previous Chat") if conv else "Previous Chat"
                         snippet = hit["content"][:200].replace("\n", " ")
                         matched_memories.append({
-                            "conversation_id": cid,
+                            "conversation_id": hit_cid,
                             "title": c_title,
                             "summary": f"Discussion in '{c_title}': {snippet}..."
                         })

@@ -80,6 +80,7 @@ app.add_middleware(
 class CreateConversationRequest(BaseModel):
     title: Optional[str] = "New Conversation"
     model: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 class UpdateConversationRequest(BaseModel):
@@ -91,6 +92,7 @@ class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
     message: str
     model: Optional[str] = None
+    user_id: Optional[str] = None
 
 
 
@@ -133,12 +135,13 @@ async def list_conversations():
 
 
 @app.post("/api/conversations")
-async def create_conversation(req: CreateConversationRequest):
+async def create_conversation(req: CreateConversationRequest, request: Request):
     """Create a new conversation session."""
     try:
+        user_id = req.user_id or request.headers.get("X-User-Id") or "default_user"
         model = req.model or model_manager.get_default_model()
         title = req.title or "New Conversation"
-        conv = memory_manager.create_conversation(title=title, model=model)
+        conv = memory_manager.create_conversation(title=title, model=model, user_id=user_id)
         return conv
     except Exception as e:
         logger.error(f"Error creating conversation: {e}")
@@ -212,18 +215,32 @@ async def search_memory(query: str, exclude_id: Optional[str] = None):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/api/user-memories")
+async def get_user_memories_route(user_id: Optional[str] = "default_user"):
+    """Retrieve all persistent personal facts stored in MongoDB for a user."""
+    uid = (user_id or "default_user").strip()
+    memories = memory_manager.get_user_memories(user_id=uid)
+    return {
+        "user_id": uid,
+        "count": len(memories),
+        "memories": memories
+    }
+
+
 
 # SSE STREAMING CHAT ENDPOINT
 
 
 @app.post("/api/chat")
-async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
+async def chat_stream(req: ChatRequest, request: Request, background_tasks: BackgroundTasks):
     """
     Main SSE endpoint for running DevAgent with:
-    1. Cross-chat memory lookup and injection.
-    2. Message persistence in MongoDB.
-    3. Multi-model execution with automatic fallback on 429/rate-limit.
-    4. Real-time agent transfer, tool execution, and code review streaming.
+    1. Persistent personal memory intent extraction and MongoDB storage.
+    2. Persistent personal memory retrieval and context injection.
+    3. Cross-chat conversation memory lookup and injection.
+    4. Message persistence in MongoDB.
+    5. Multi-model execution with automatic fallback on 429/rate-limit.
+    6. Real-time agent transfer, tool execution, and code review streaming.
     """
     conversation_id = req.conversation_id or str(uuid.uuid4())
     user_message = req.message.strip()
@@ -232,44 +249,82 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     conv = memory_manager.get_conversation(conversation_id)
+    user_id = req.user_id or request.headers.get("X-User-Id") or (conv.get("user_id") if conv else None) or "default_user"
+
     if not conv:
         # Auto-create if not existing
         conv = memory_manager.create_conversation(
             conversation_id=conversation_id,
             title=user_message[:40] + ("..." if len(user_message) > 40 else ""),
-            model=req.model or model_manager.get_default_model()
+            model=req.model or model_manager.get_default_model(),
+            user_id=user_id
         )
 
-    # 1. Retrieve cross-chat context from other conversations
+    # 1. Process persistent personal memory intent (save/update)
+    memory_intent = memory_manager.extract_memory_intent(user_message)
+    memory_action_note = None
+    if memory_intent:
+        action = memory_intent["action"]
+        key = memory_intent["key"]
+        val = memory_intent["value"]
+        is_saved = memory_manager.save_user_memory(user_id=user_id, key=key, value=val)
+        if is_saved:
+            action_desc = "updated" if action == "update" else "saved"
+            memory_action_note = (
+                f"[SYSTEM NOTICE: The user explicitly requested to {action} their {key} as '{val}'. "
+                f"This has been successfully {action_desc} in MongoDB persistent storage for user '{user_id}'. "
+                f"Confirm to the user that you will remember their {key} is {val}. Do NOT claim you cannot retain personal information.]"
+            )
+        else:
+            memory_action_note = (
+                f"[SYSTEM NOTICE: The user requested to {action} their {key} as '{val}', but MongoDB persistent memory storage is CURRENTLY UNAVAILABLE. "
+                f"You MUST NOT claim that permanent memory was saved. Inform the user honestly that MongoDB storage is unavailable right now, so the information could not be permanently saved.]"
+            )
+
+    # 2. Retrieve persistent personal memory for this user from MongoDB
+    personal_memory_context = memory_manager.format_personal_memory_context(user_id=user_id)
+
+    # 3. Retrieve cross-chat context from other conversations
     cross_context = memory_manager.get_cross_chat_context(
         query=user_message,
-        exclude_conversation_id=conversation_id
+        exclude_conversation_id=conversation_id,
+        user_id=user_id
     )
 
-    # 2. Persist user message in MongoDB
+    # 4. Persist user message in MongoDB
     memory_manager.save_message(
         conversation_id=conversation_id,
         role="user",
         content=user_message
     )
 
-    # 3. Build fallback chain
+    # 5. Build fallback chain
     target_model = req.model or conv.get("model") or model_manager.get_default_model()
     fallback_chain = model_manager.get_fallback_chain(target_model)
 
     async def _internal_stream():
         # Emit initial start event
+        has_any_memory = bool(cross_context or personal_memory_context or memory_action_note)
         yield ServerSentEvent(
             event="start",
             data=json.dumps({
                 "conversation_id": conversation_id,
                 "requested_model": target_model,
-                "has_cross_chat_memory": bool(cross_context),
+                "has_cross_chat_memory": has_any_memory,
+                "has_personal_memory": bool(personal_memory_context),
                 "fallback_chain": fallback_chain
             })
         )
 
-        if cross_context:
+        if personal_memory_context or memory_action_note:
+            yield ServerSentEvent(
+                event="memory_context",
+                data=json.dumps({
+                    "info": "Retrieved persistent personal memory from MongoDB.",
+                    "snippet": (personal_memory_context or memory_action_note)[:300]
+                })
+            )
+        elif cross_context:
             yield ServerSentEvent(
                 event="memory_context",
                 data=json.dumps({
@@ -279,15 +334,24 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
             )
 
         # Build prompt for ADK Agent
-        if cross_context:
-            prompt_for_agent = (
-                f"[RELEVANT CONTEXT FROM PREVIOUS CONVERSATIONS]:\n"
-                f"{cross_context}\n\n"
-                f"[USER TASK]:\n"
-                f"{user_message}"
+        prompt_sections = []
+        if personal_memory_context:
+            prompt_sections.append(personal_memory_context)
+        elif re.search(r'\b(?:my\s+name|who\s+am\s+i|remember\s+my|do\s+you\s+remember)\b', user_message, re.I) and not memory_intent:
+            prompt_sections.append(
+                f"[PERSISTENT PERSONAL MEMORY (RETRIEVED FROM MONGODB)]:\n"
+                f"No personal memory has been saved for user '{user_id}' in MongoDB yet.\n"
+                f"If the user asks if you remember their name or personal details, honestly state that you do not have that information in your memory."
             )
-        else:
-            prompt_for_agent = user_message
+
+        if memory_action_note:
+            prompt_sections.append(memory_action_note)
+
+        if cross_context:
+            prompt_sections.append(f"[RELEVANT CONTEXT FROM PREVIOUS CONVERSATIONS]:\n{cross_context}")
+
+        prompt_sections.append(f"[USER TASK]:\n{user_message}")
+        prompt_for_agent = "\n\n".join(prompt_sections)
 
         # Execution with Model Fallback
         success = False
@@ -300,13 +364,13 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
         active_runner = get_runner()
         sess = await active_runner.session_service.get_session(
             app_name=active_runner.app_name,
-            user_id="user",
+            user_id=user_id,
             session_id=conversation_id
         )
         if sess is None:
             await active_runner.session_service.create_session(
                 app_name=active_runner.app_name,
-                user_id="user",
+                user_id=user_id,
                 session_id=conversation_id
             )
 
@@ -327,7 +391,7 @@ async def chat_stream(req: ChatRequest, background_tasks: BackgroundTasks):
 
                 # Run ADK agent turn
                 async for event in active_runner.run_async(
-                    user_id="user",
+                    user_id=user_id,
                     session_id=conversation_id,
                     new_message=types.Content(
                         role="user",
