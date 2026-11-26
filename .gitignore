@@ -97,3 +97,6 @@ workspace/
 
 #static
 static/
+
+verify_auth_tests.py/
+verify_all_tests.py/

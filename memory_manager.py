@@ -113,18 +113,22 @@ class MongoMemoryManager:
         doc.pop("_id", None)
         return doc
 
-    def list_conversations(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """List all conversations ordered by most recently updated."""
+    def list_conversations(self, user_id: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """List conversations ordered by most recently updated, optionally filtered by user_id."""
         items = []
+        query: Dict[str, Any] = {}
+        if user_id:
+            query["user_id"] = user_id
+
         if self._is_connected and self.conversations is not None:
             try:
-                cursor = self.conversations.find({}, {"_id": 0}).sort("updated_at", DESCENDING).limit(limit)
+                cursor = self.conversations.find(query, {"_id": 0}).sort("updated_at", DESCENDING).limit(limit)
                 items = list(cursor)
             except Exception as e:
                 logger.error("Error listing conversations: %s", e)
 
         if not items:
-            items = list(self._mem_conversations.values())
+            items = [c for c in self._mem_conversations.values() if not user_id or c.get("user_id") == user_id]
             items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
 
         for it in items:

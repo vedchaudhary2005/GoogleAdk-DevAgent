@@ -14,7 +14,7 @@ import re
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, Response, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -27,6 +27,8 @@ from google.genai import types
 
 import model_manager
 import memory_manager
+import auth_manager
+from auth_manager import auth_manager as auth_mgr
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("devagent.server")
@@ -50,6 +52,7 @@ async def lifespan(app: FastAPI):
     global runner
     logger.info("Initializing DevAgent runner and connecting to MongoDB...")
     memory_manager.memory_manager.connect()
+    auth_mgr.ensure_indexes()
     runner = get_runner()
     logger.info("DevAgent Enterprise server started successfully.")
     yield
@@ -64,17 +67,57 @@ app = FastAPI(
 )
 
 # Enable CORS for local dev / frontend integration
+CORS_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+SESSION_COOKIE_NAME = auth_manager.SESSION_COOKIE_NAME
+SESSION_COOKIE_MAX_AGE = auth_manager.SESSION_EXPIRE_DAYS * 24 * 3600
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
+
+async def get_current_user(request: Request) -> Dict[str, Any]:
+    """
+    Strict authentication dependency.
+    Extracts session from secure HTTP-only cookie (or Authorization Bearer).
+    Validates token hash in MongoDB sessions collection.
+    Rejects unauthenticated requests with HTTP 401.
+    NEVER trusts client-supplied X-User-Id or req.user_id.
+    """
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        auth_h = request.headers.get("Authorization")
+        if auth_h and auth_h.startswith("Bearer "):
+            token = auth_h[7:].strip()
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required. Please sign in with Google.")
+
+    user = auth_mgr.get_user_from_session(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Session expired or invalid. Please sign in again.")
+
+    return user
 
 
 # PYDANTIC SCHEMAS
+
+
+class GoogleLoginRequest(BaseModel):
+    credential: str
 
 
 class CreateConversationRequest(BaseModel):
@@ -96,7 +139,84 @@ class ChatRequest(BaseModel):
 
 
 
-# API ROUTES
+# API ROUTES: AUTHENTICATION
+
+
+@app.get("/auth/config")
+async def get_auth_config():
+    """Return public auth config (Google Client ID) for frontend initialization."""
+    return {
+        "client_id": os.getenv("GOOGLE_CLIENT_ID", "")
+    }
+
+
+@app.post("/auth/google")
+async def google_login(req: GoogleLoginRequest, response: Response):
+    """
+    Authenticate with Google ID token:
+    1. Verify Google token signature and audience (GOOGLE_CLIENT_ID).
+    2. Upsert user in MongoDB users collection.
+    3. Generate cryptographically secure session token and hash it for MongoDB storage.
+    4. Set secure HTTP-only session cookie.
+    5. Return safe user profile.
+    """
+    if not req.credential:
+        raise HTTPException(status_code=400, detail="Missing Google credential")
+
+    id_info = auth_mgr.verify_google_id_token(req.credential)
+    if not id_info:
+        raise HTTPException(status_code=401, detail="Invalid Google ID token")
+
+    try:
+        user = auth_mgr.upsert_google_user(id_info)
+        session_token = auth_mgr.create_session(user["user_id"])
+
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=session_token,
+            httponly=True,
+            samesite="lax",
+            secure=COOKIE_SECURE,
+            max_age=SESSION_COOKIE_MAX_AGE,
+            path="/"
+        )
+
+        return {
+            "user": user,
+            "message": "Login successful"
+        }
+    except Exception as e:
+        logger.error(f"Error during Google login: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process login")
+
+
+@app.get("/auth/me")
+async def get_current_user_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Return currently authenticated user profile."""
+    return {"user": current_user}
+
+
+@app.post("/auth/logout")
+async def logout(request: Request, response: Response):
+    """Revoke session and clear session cookie."""
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        auth_h = request.headers.get("Authorization")
+        if auth_h and auth_h.startswith("Bearer "):
+            token = auth_h[7:].strip()
+
+    if token:
+        auth_mgr.revoke_session(token)
+
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/"
+    )
+    return {"message": "Logged out successfully"}
+
+
+
+# API ROUTES: CORE & CONVERSATIONS
 
 
 @app.get("/api/health")
@@ -124,10 +244,10 @@ async def get_models():
 
 
 @app.get("/api/conversations")
-async def list_conversations():
-    """Retrieve all conversations ordered by recent activity."""
+async def list_conversations(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Retrieve all conversations for the authenticated user ordered by recent activity."""
     try:
-        convs = memory_manager.list_conversations()
+        convs = memory_manager.list_conversations(user_id=current_user["user_id"])
         return {"conversations": convs}
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")
@@ -135,10 +255,10 @@ async def list_conversations():
 
 
 @app.post("/api/conversations")
-async def create_conversation(req: CreateConversationRequest, request: Request):
-    """Create a new conversation session."""
+async def create_conversation(req: CreateConversationRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Create a new conversation session associated exclusively with the authenticated user."""
     try:
-        user_id = req.user_id or request.headers.get("X-User-Id") or "default_user"
+        user_id = current_user["user_id"]
         model = req.model or model_manager.get_default_model()
         title = req.title or "New Conversation"
         conv = memory_manager.create_conversation(title=title, model=model, user_id=user_id)
@@ -149,12 +269,14 @@ async def create_conversation(req: CreateConversationRequest, request: Request):
 
 
 @app.get("/api/conversations/{conversation_id}")
-async def get_conversation(conversation_id: str):
-    """Get conversation details and full message history."""
+async def get_conversation(conversation_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Get conversation details and full message history, enforcing ownership."""
     try:
         conv = memory_manager.get_conversation(conversation_id)
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation not found")
+        if conv.get("user_id") and conv.get("user_id") != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied: conversation belongs to another user")
         messages = memory_manager.get_messages(conversation_id)
         return {
             "conversation": conv,
@@ -168,9 +290,19 @@ async def get_conversation(conversation_id: str):
 
 
 @app.patch("/api/conversations/{conversation_id}")
-async def update_conversation(conversation_id: str, req: UpdateConversationRequest):
-    """Rename conversation or change default model."""
+async def update_conversation(
+    conversation_id: str,
+    req: UpdateConversationRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Rename conversation or change default model, enforcing ownership."""
     try:
+        conv = memory_manager.get_conversation(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if conv.get("user_id") and conv.get("user_id") != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied: conversation belongs to another user")
+
         success = memory_manager.update_conversation(
             conversation_id=conversation_id,
             title=req.title,
@@ -188,23 +320,36 @@ async def update_conversation(conversation_id: str, req: UpdateConversationReque
 
 
 @app.delete("/api/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
-    """Delete conversation and all its messages."""
+async def delete_conversation(conversation_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Delete conversation and all its messages, enforcing ownership."""
     try:
+        conv = memory_manager.get_conversation(conversation_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        if conv.get("user_id") and conv.get("user_id") != current_user["user_id"]:
+            raise HTTPException(status_code=403, detail="Access denied: conversation belongs to another user")
+
         success = memory_manager.delete_conversation(conversation_id)
         return {"deleted": success, "conversation_id": conversation_id}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error deleting conversation {conversation_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/memory")
-async def search_memory(query: str, exclude_id: Optional[str] = None):
-    """Search relevant cross-chat memory snippets."""
+async def search_memory(
+    query: str,
+    exclude_id: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """Search relevant cross-chat memory snippets isolated to the authenticated user."""
     try:
         context = memory_manager.get_cross_chat_context(
             query=query,
-            exclude_conversation_id=exclude_id
+            exclude_conversation_id=exclude_id,
+            user_id=current_user["user_id"]
         )
         return {
             "query": query,
@@ -216,9 +361,9 @@ async def search_memory(query: str, exclude_id: Optional[str] = None):
 
 
 @app.get("/api/user-memories")
-async def get_user_memories_route(user_id: Optional[str] = "default_user"):
-    """Retrieve all persistent personal facts stored in MongoDB for a user."""
-    uid = (user_id or "default_user").strip()
+async def get_user_memories_route(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Retrieve all persistent personal facts stored in MongoDB strictly for the authenticated user."""
+    uid = current_user["user_id"]
     memories = memory_manager.get_user_memories(user_id=uid)
     return {
         "user_id": uid,
@@ -232,7 +377,12 @@ async def get_user_memories_route(user_id: Optional[str] = "default_user"):
 
 
 @app.post("/api/chat")
-async def chat_stream(req: ChatRequest, request: Request, background_tasks: BackgroundTasks):
+async def chat_stream(
+    req: ChatRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """
     Main SSE endpoint for running DevAgent with:
     1. Persistent personal memory intent extraction and MongoDB storage.
@@ -241,7 +391,9 @@ async def chat_stream(req: ChatRequest, request: Request, background_tasks: Back
     4. Message persistence in MongoDB.
     5. Multi-model execution with automatic fallback on 429/rate-limit.
     6. Real-time agent transfer, tool execution, and code review streaming.
+    All strictly isolated to the authenticated user.
     """
+    user_id = current_user["user_id"]
     conversation_id = req.conversation_id or str(uuid.uuid4())
     user_message = req.message.strip()
 
@@ -249,9 +401,10 @@ async def chat_stream(req: ChatRequest, request: Request, background_tasks: Back
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
     conv = memory_manager.get_conversation(conversation_id)
-    user_id = req.user_id or request.headers.get("X-User-Id") or (conv.get("user_id") if conv else None) or "default_user"
-
-    if not conv:
+    if conv:
+        if conv.get("user_id") and conv.get("user_id") != user_id:
+            raise HTTPException(status_code=403, detail="Access denied: conversation belongs to another user")
+    else:
         # Auto-create if not existing
         conv = memory_manager.create_conversation(
             conversation_id=conversation_id,
