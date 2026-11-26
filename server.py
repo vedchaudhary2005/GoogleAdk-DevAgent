@@ -184,6 +184,8 @@ async def google_login(req: GoogleLoginRequest, response: Response):
 
         return {
             "user": user,
+            "session_token": session_token,
+            "token": session_token,
             "message": "Login successful"
         }
     except Exception as e:
