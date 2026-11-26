@@ -66,7 +66,7 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for local dev / frontend integration
+# Enable CORS for local dev & production deployments (Vercel, Render, localhost)
 CORS_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -78,7 +78,7 @@ CORS_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origin_regex=r"^https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,6 +87,7 @@ app.add_middleware(
 SESSION_COOKIE_NAME = auth_manager.SESSION_COOKIE_NAME
 SESSION_COOKIE_MAX_AGE = auth_manager.SESSION_EXPIRE_DAYS * 24 * 3600
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+COOKIE_SAMESITE = "none" if COOKIE_SECURE else "lax"
 
 
 async def get_current_user(request: Request) -> Dict[str, Any]:
@@ -175,7 +176,7 @@ async def google_login(req: GoogleLoginRequest, response: Response):
             key=SESSION_COOKIE_NAME,
             value=session_token,
             httponly=True,
-            samesite="lax",
+            samesite=COOKIE_SAMESITE,
             secure=COOKIE_SECURE,
             max_age=SESSION_COOKIE_MAX_AGE,
             path="/"
@@ -210,7 +211,9 @@ async def logout(request: Request, response: Response):
 
     response.delete_cookie(
         key=SESSION_COOKIE_NAME,
-        path="/"
+        path="/",
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE
     )
     return {"message": "Logged out successfully"}
 
