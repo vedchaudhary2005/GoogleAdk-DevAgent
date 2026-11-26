@@ -92,11 +92,12 @@ desktop.ini
 # Frontend
 frontend/
 
-#workspace
+# Workspace
 workspace/
 
-#static
+# Static files
 static/
 
-verify_auth_tests.py/
-verify_all_tests.py/
+# Test files
+verify_auth_tests.py
+verify_all_tests.py
